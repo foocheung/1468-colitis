@@ -21,7 +21,13 @@
 5. Conduct pathway enrichment analysis to investigate biological processes associated with DSS-induced colitis.
 6. Integrate cell proportion, differential expression, and pathway results to identify key endothelial responses during inflammation and recovery.
 
-### Current Report
 
+### Current HTML Report
+
+**Step 1: QC, HTO Demultiplexing, and Endothelial Annotation**
+
+[View HTML Report on GitHub](https://github.com/foocheung/1468-colitis/blob/main/Reports/NIAID1468_01_QC_annotation_PI_first_pass_v4.html)
+To view the report correctly, download the HTML file from GitHub and open it locally in a web browser (Chrome, Firefox, or Safari). GitHub does not render the interactive HTML report directly.
+View HTML Report on GitHub
 
 **Status:** Initial QC and endothelial annotation completed. Downstream DSS time-course analyses are planned.
