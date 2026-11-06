@@ -1,0 +1,662 @@
+---
+title: "NIAID-1468 | Step 1: QC, HTO and annotation"
+subtitle: "Mouse colonic endothelial cells, DSS time course"
+# Quick test (set test_cells > 0; writes to 01_QC_annotations_TEST):
+#   quarto render NIAID1468_01_QC_annotation_PI_first_pass_v9_clean_EC_annotation.qmd -P test_cells:5000
+# Real run (all cells; run the detailed one first, it builds the caches):
+#   quarto render NIAID1468_01_QC_annotation_PI_first_pass_v9_clean_EC_annotation.qmd -P test_cells:0 -P detail:full    -o NIAID1468_01_detailed.html
+#   quarto render NIAID1468_01_QC_annotation_PI_first_pass_v9_clean_EC_annotation.qmd -P test_cells:0 -P detail:summary -o NIAID1468_01_summary.html
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "code"
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+params:
+  detail: "summary"          # "summary" | "full"
+  test_cells: 0           # >0 = random subset (stratified by library) for debugging; 0 = ALL cells
+  base_dir: "/vf/users/cheungf/NIAID-1468-colitis/NIAID-1468/cellseek_execution/seurat/analysis"
+  original_cluster_col: "RNA_snn_res.0.8"
+  ec_resolution: 0.6
+  npcs: 30
+  ec_nfeatures: 3000
+  force_annotation: false    # true = recompute SingleR/MCA caches
+  force_recluster: false     # true = rebuild EC PCA/Harmony/UMAP/clusters
+---
+
+```{r setup}
+suppressPackageStartupMessages({library(Seurat); library(ggplot2); library(dplyr); library(patchwork); library(DT)})
+source("R/niaid1468_helpers.R")
+if (!exists("HELPERS_VERSION") || HELPERS_VERSION < 2) stop("Stale R/niaid1468_helpers.R: copy the latest version next to this QMD")
+# Atomic RDS save: write to .tmp, read it back in full (fails on a truncated file), then rename into place.
+# A killed job or full quota therefore leaves the previous file (or none), never a half-written one.
+save_rds_atomic <- function(x, path) {
+  tmp <- paste0(path, ".tmp"); on.exit(unlink(tmp), add = TRUE)
+  saveRDS(x, tmp)
+  chk <- readRDS(tmp); ok <- identical(colnames(chk), colnames(x)); rm(chk); invisible(gc(verbose = FALSE))
+  if (!ok) stop("Read-back check failed for ", tmp)
+  if (!file.rename(tmp, path)) stop("Could not move ", tmp, " to ", path)
+  invisible(path)
+}
+read_rds_ok <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  tryCatch(readRDS(path), error = function(e) { warning("Unreadable RDS (will be rebuilt): ", path, " - ", conditionMessage(e)); NULL })
+}
+options(ggrepel.max.overlaps = Inf)
+# per-chunk timing, printed to the console while rendering
+knitr::knit_hooks$set(timer = function(before, options) {
+  if (before) assign(".t0", Sys.time(), envir = globalenv())
+  else message(sprintf("[TIMER] %-18s %6.1f min", options$label,
+                       as.numeric(difftime(Sys.time(), get(".t0", globalenv()), units = "mins"))))
+})
+knitr::opts_chunk$set(timer = TRUE)
+full      <- params$detail == "full"
+base      <- params$base_dir
+test_n    <- params$test_cells
+outdir    <- file.path(base, if (test_n > 0) "01_QC_annotations_TEST" else "01_QC_annotations")
+cache_dir <- file.path(outdir, "annotation_cache")
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+.t <- Sys.time(); tick <- function(msg) { message(sprintf("[TIMER] setup: %-14s %6.1f min", msg, as.numeric(difftime(Sys.time(), .t, units = "mins")))); .t <<- Sys.time() }
+obj <- readRDS(file.path(base, "03_SingleR_fast/NIAID1468_SingleR_annotated.rds")); tick("readRDS")
+# drop everything this report does not use BEFORE subsetting (subset() touches every assay/layer)
+obj <- DietSeurat(obj, assays = intersect(c("RNA", "HTO"), Assays(obj)),
+                  dimreducs = intersect(c("pca", "umap_merged", "umap"), Reductions(obj)),
+                  graphs = NULL, scale.data = FALSE)
+tick("DietSeurat")
+if (test_n > 0) {
+  set.seed(1468)
+  by_lib <- split(colnames(obj), obj$library_id)
+  keep_cells <- unlist(lapply(by_lib, function(v) sample(v, min(length(v), ceiling(test_n / length(by_lib))))))
+  obj <- subset(obj, cells = keep_cells)
+}
+tick("subset")
+obj <- prep_rna(obj); tick("prep_rna")
+
+key <- sample_key()
+ix  <- match(as.character(obj$library_id), key$library_id)
+stopifnot(!anyNA(ix))
+obj$DSS_day     <- key$DSS_day[ix]
+obj$sample_name <- key$sample_name[ix]
+obj$mouse_id    <- paste(obj$library_id, obj$HTO_classification, sep = "_")
+if (!"percent.mt" %in% colnames(obj[[]]))
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-")
+```
+
+```{r test-banner}
+#| output: asis
+if (test_n > 0) cat("::: {.callout-warning}\n**TEST RUN:** random subset of", ncol(obj),
+  "cells. Results are for debugging only. Use `-P test_cells:0` for the full analysis.\n:::\n")
+```
+
+::: {.callout-note}
+LIB_16190 is Day 5 in the sample key but Day 9 in the TAS; confirm with the PI.
+D0, D5, D14 and D21 are each a single library, so library and day are confounded.
+:::
+
+## 1. Samples and QC
+
+One row per library: design, post-filter RNA QC and HTO calling.
+
+```{r libraries}
+hto_csv <- file.path(base, "02_HTO_and_annotation/HTO_QC_compact_summary.csv")
+lib <- obj[[]] |>
+  group_by(library_id, sample_name, DSS_day) |>
+  summarise(mice = n_distinct(mouse_id), cells = n(),
+            median_UMI = median(nCount_RNA), median_genes = median(nFeature_RNA),
+            median_pct_mt = median(percent.mt), .groups = "drop") |>
+  arrange(DSS_day, sample_name)
+if (file.exists(hto_csv))
+  lib <- left_join(lib, read.csv(hto_csv) |>
+    transmute(library_id = library, droplets = total, singlet_pct, doublet_pct, negative_pct),
+    by = "library_id")
+dt(lib, page = 8)
+```
+
+```{r qc-violin}
+#| fig-width: 13
+#| fig-height: 4.5
+VlnPlot(obj, features = c("nCount_RNA", "nFeature_RNA", "percent.mt"),
+        group.by = "library_id", pt.size = 0, ncol = 3)
+```
+
+## 2. HTO
+
+HTO calls from the original demultiplexing (all droplets, read from the cached CSVs) and hashtag balance in the retained cells.
+
+```{r hto-table}
+if (file.exists(hto_csv)) dt(read.csv(hto_csv), page = 8) else cat("MISSING:", hto_csv)
+```
+
+```{r hto-calls-plot}
+#| fig-width: 12
+#| fig-height: 4.5
+if (file.exists(hto_csv)) {
+  ql <- tidyr::pivot_longer(read.csv(hto_csv), c(singlet_pct, doublet_pct, negative_pct),
+                            names_to = "class", values_to = "percent")
+  ggplot(ql, aes(library, percent, fill = class)) + geom_col() + theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = "HTO calls, all droplets", x = NULL, y = "%")
+}
+```
+
+```{r hto-balance}
+#| fig-width: 12
+#| fig-height: 4.5
+hb <- obj[[]] |> count(library_id, HTO_classification, name = "cells") |>
+  group_by(library_id) |> mutate(percent = 100 * cells / sum(cells)) |> ungroup()
+write.csv(hb, file.path(outdir, "HTO_retained_hashtag_balance.csv"), row.names = FALSE)
+ggplot(hb, aes(library_id, percent, fill = HTO_classification)) + geom_col() + theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Retained cells per hashtag (not the original HTO calling rates)", x = NULL, y = "%")
+```
+
+```{r hto-balance-full}
+#| eval: !expr full
+dt(hb, page = 12)
+```
+
+```{r hto-class-full}
+#| eval: !expr full
+hto_cls <- file.path(dirname(hto_csv), "HTO_classification_summary.csv")
+if (file.exists(hto_cls)) dt(read.csv(hto_cls), page = 10) else cat("MISSING:", hto_cls)
+```
+
+```{r hto-signals-full}
+#| eval: !expr full
+#| fig-width: 13
+#| fig-height: 5
+# HTO count distributions in retained cells only
+if ("HTO" %in% Assays(obj) && "counts" %in% SeuratObject::Layers(obj[["HTO"]])) {
+  hto <- SeuratObject::LayerData(obj, assay = "HTO", layer = "counts")
+  cells <- sample(colnames(hto), min(ncol(hto), 12000))
+  x <- log1p(as.matrix(hto[, cells, drop = FALSE]))
+  long <- data.frame(HTO = rep(rownames(x), times = ncol(x)), value = as.vector(x))
+  ggplot(long, aes(value)) + geom_density() + facet_wrap(~HTO, scales = "free_y") +
+    theme_bw() + labs(title = "HTO counts, retained cells", x = "log1p(HTO count)")
+} else cat("HTO counts layer absent or split; skipped.")
+```
+
+## 3. Annotation of all cells (before EC reclustering)
+
+SingleR gives per-cell broad labels; MCA labels are per original cluster.
+MCA names are the nearest reference type, not tissue of origin.
+
+```{r pre-annotation}
+#| fig-width: 15
+#| fig-height: 5
+orig   <- params$original_cluster_col
+stopifnot(orig %in% colnames(obj[[]]))
+pre_cl <- as.character(obj[[orig, drop = TRUE]])
+sr  <- annotate_singler(obj, file.path(cache_dir, "pre_SingleR_predictions.csv"), params$force_annotation)
+mca <- annotate_mca(obj, pre_cl, file.path(cache_dir, "pre_MCA_predictions_cluster.csv"), params$force_annotation)
+obj <- add_labels(obj, sr, "pre_SingleR")
+obj <- add_labels(obj, mca, "pre_MCA")
+
+red_pre <- intersect(c("umap_merged", "umap"), Reductions(obj))[1]
+umap_panel(obj, red_pre, c(orig, "pre_SingleR_pruned", "pre_MCA_pruned"))
+```
+
+```{r pre-table}
+dt(cluster_summary(obj, orig, c(SingleR = "pre_SingleR_pruned", MCA = "pre_MCA_pruned")), page = 10)
+```
+
+```{r pre-table-full}
+#| eval: !expr full
+# detailed report only: every cluster x label count
+dt(as.data.frame(table(cluster = pre_cl, SingleR = obj$pre_SingleR_pruned,
+                       MCA = obj$pre_MCA_pruned, useNA = "ifany")) |> filter(Freq > 0),
+   page = 10)
+```
+
+## 4. Endothelial selection
+
+```{r ec-select}
+m         <- norm_matrix(obj)
+ec_mk     <- intersect(c("Pecam1", "Cdh5", "Kdr", "Emcn", "Vwf"), rownames(m))
+marker_pos <- Matrix::colSums(m[ec_mk, , drop = FALSE] > 0) >= 2
+ref_ec    <- grepl("endothel", obj$pre_SingleR_label,  ignore.case = TRUE) |
+             grepl("endothel", obj$pre_SingleR_pruned, ignore.case = TRUE)
+keep      <- marker_pos | ref_ec
+write.csv(data.frame(cell = colnames(obj), SingleR = obj$pre_SingleR_label,
+                     marker_pos, ref_ec, keep_EC = keep),
+          file.path(outdir, "EC_selection_audit.csv"), row.names = FALSE)
+rm(m); invisible(gc())
+```
+
+Kept **`r format(sum(keep), big.mark = ",")`** of `r format(length(keep), big.mark = ",")` cells
+(≥2 of `r length(ec_mk)` pan-EC markers detected, or SingleR = endothelial).
+
+```{r ec-select-full}
+#| eval: !expr full
+dt(as.data.frame(table(marker_pos = marker_pos, SingleR_endothelial = ref_ec)))
+```
+
+## 5. EC reclustering and Harmony check (visual only)
+
+```{r ec-build}
+sig  <- list(res = params$ec_resolution, npcs = params$npcs, nfeat = params$ec_nfeatures,
+             n = sum(keep))
+ckpt <- file.path(outdir, "checkpoint_EC.rds")
+ec <- NULL
+if (!params$force_recluster && file.exists(ckpt)) {
+  tmp <- read_rds_ok(ckpt)   # NULL if the checkpoint is truncated/corrupt -> EC object is rebuilt
+  if (inherits(tmp, "Seurat") && identical(tmp@misc$sig, sig) && setequal(colnames(tmp), colnames(obj)[keep])) ec <- tmp
+  rm(tmp)
+}
+rebuilt <- is.null(ec)
+if (rebuilt) {
+  dims <- seq_len(params$npcs)
+  ec <- subset(obj, cells = colnames(obj)[keep])
+  ec <- NormalizeData(ec, verbose = FALSE)
+  ec <- FindVariableFeatures(ec, nfeatures = params$ec_nfeatures, verbose = FALSE)
+  ec <- ScaleData(ec, verbose = FALSE)
+  ec <- RunPCA(ec, npcs = params$npcs, verbose = FALSE)
+  ec <- RunUMAP(ec, reduction = "pca", dims = dims, reduction.name = "umap_unint", verbose = FALSE)
+  ec <- harmony::RunHarmony(ec, group.by.vars = "library_id", reduction.save = "harmony", verbose = FALSE)
+  ec <- RunUMAP(ec, reduction = "harmony", dims = dims, reduction.name = "umap_harmony", verbose = FALSE)
+  ec <- FindNeighbors(ec, reduction = "pca", dims = dims, verbose = FALSE)  # clusters use unintegrated PCA
+  ec <- FindClusters(ec, resolution = params$ec_resolution, cluster.name = "EC_cluster", verbose = FALSE)
+  ec@misc$mixing <- data.frame(
+    embedding = c("PCA (before Harmony)", "Harmony (after)"),
+    library_mixing = c(mixing_score(ec, "pca"), mixing_score(ec, "harmony")))
+  ec@misc$sig <- sig
+  save_rds_atomic(ec, ckpt)
+}
+Idents(ec) <- "EC_cluster"
+# always refresh metadata carried over from the all-cell object
+carry <- c("DSS_day", "sample_name", "mouse_id", grep("^pre_", colnames(obj[[]]), value = TRUE))
+for (f in carry) ec[[f]] <- obj[[f, drop = TRUE]][match(colnames(ec), colnames(obj))]
+```
+
+Top row: unintegrated PCA (used for clustering). Bottom row: Harmony on library, shown for comparison only.
+
+```{r harmony-umaps}
+#| fig-width: 12
+#| fig-height: 9
+umap_panel(ec, "umap_unint",   c("library_id", "DSS_day"), prefix = "Before Harmony:") /
+umap_panel(ec, "umap_harmony", c("library_id", "DSS_day"), prefix = "After Harmony:")
+```
+
+```{r mixing}
+dt(ec@misc$mixing, digits = 3, page = 5)
+```
+
+Library mixing: 1 = neighbours evenly spread over the 8 libraries. Harmony is not used downstream:
+4 of 6 days are a single library, so library differences are largely true day-to-day biology.
+Clusters, annotation and DE (mouse-level pseudobulk from raw counts) all use unintegrated data.
+
+## 6. EC annotation (after reclustering)
+
+We first compare the reclustered endothelial populations with two reference-based
+annotation methods. **SingleR** supplies broad cell identities, while **Mouse Cell
+Atlas (MCA)** supplies the closest matching reference labels. MCA labels may name
+specific source tissues (e.g., neonatal skin, heart, pancreas, or ovary); these
+are **reference origins, not evidence that the colon cells came from those tissues**.
+A more specific reference label is not necessarily a more accurate colon
+endothelial subtype annotation.
+
+```{r post-annotation}
+#| fig-width: 12
+#| fig-height: 5
+mca2 <- annotate_mca(ec, as.character(ec$EC_cluster),
+                     file.path(cache_dir, "post_MCA_predictions_cluster.csv"), params$force_annotation)
+ec <- add_labels(ec, mca2, "post_MCA")
+
+# Reference-based annotation only for this initial PI-facing report.
+# Subtype assignments are deferred until the marker expression patterns are reviewed.
+red_post <- "umap_unint"
+umap_panel(ec, red_post, c("EC_cluster", "pre_SingleR_pruned", "post_MCA_pruned"))
+```
+
+### Reference-based annotations by EC cluster
+
+The percentages below describe the **fraction of cells within each cluster**
+assigned the displayed label, **not** a prediction confidence or probability.
+SingleR annotations were generated per cell before EC reclustering; MCA
+annotations were obtained using the reclustered EC populations.
+
+```{r post-table}
+tab <- cluster_summary(ec, "EC_cluster",
+                       c(SingleR = "pre_SingleR_pruned", MCA = "post_MCA_pruned"))
+# Keep only cluster size and the two reference labels (with their label frequencies).
+# Exclude library/day composition, marker scores and provisional subtypes.
+pi_cols <- intersect(c("cluster", "n", "N", "n_cells", "cells", "SingleR", "MCA"), names(tab))
+stopifnot(all(c("cluster", "SingleR", "MCA") %in% pi_cols))
+dt(tab[, pi_cols, drop = FALSE], page = 16)
+```
+
+### Endothelial marker expression by EC cluster
+
+The dot plot below provides **independent biological evidence** for refining the
+reference-based labels. Pan-endothelial markers help assess endothelial identity;
+arterial, capillary, venous and lymphatic markers can guide subsequent subtype
+annotation. Activation and non-endothelial markers help identify cell states and
+possible contamination. These patterns are exploratory and **do not yet establish
+final subtype labels**.
+
+```{r dotplot}
+#| fig-width: 13
+#| fig-height: 6
+marker_sets <- list(
+  Pan_EC    = c("Pecam1", "Cdh5", "Kdr", "Emcn", "Vwf"),
+  Arterial  = c("Gja5", "Sox17", "Efnb2", "Bmx"),
+  Capillary = c("Plvap", "Rgcc", "Car4"),
+  Venous    = c("Ackr1", "Nr2f2"),
+  Lymphatic = c("Prox1", "Lyve1", "Pdpn", "Flt4"),
+  Activated = c("Icam1", "Vcam1", "Sele", "Selp"),
+  NonEC     = c("Ptprc", "Epcam", "Col1a1", "Dcn", "Lum"))
+marker_sets <- Filter(length, lapply(marker_sets, intersect, rownames(ec)))
+DotPlot(ec, features = marker_sets, group.by = "EC_cluster", assay = "RNA") +
+  RotatedAxis() +
+  labs(title = "Endothelial and lineage marker expression across EC clusters",
+       x = "Marker genes", y = "EC cluster")
+```
+
+**Next step:** Use the dot-plot expression patterns, together with additional
+cluster-specific markers, to determine whether individual clusters represent
+arterial, capillary, venous or lymphatic endothelium, activated endothelial
+states, or potential non-endothelial cells. SingleR and MCA are useful first-pass
+references, but MCA's tissue-specific label names should not be interpreted as
+validated colon endothelial subtypes.
+
+
+### Kalucka colon endothelial markers: top-20/50/100 sensitivity analysis
+
+The colon-specific marker lists are drawn from the supplied **Kalucka colon marker CSV** (seven EC subtypes, up to 649 ranks). This section compares the top 20, 50, and 100 ranked genes per subtype against the existing canonical markers, using the *same* EC checkpoint and normalized RNA expression. It does not rerun clustering or reference-based annotation, and **does not overwrite** EC subtype labels.
+
+The top-50 result is the primary exploratory comparison; top-20 and top-100 are sensitivity checks. Stable top-ranked signatures are not proof of annotation accuracy. Gene-symbol artifacts such as `4-Sep` are excluded pending verification. The input CSV should be placed next to the QMD, or its path supplied through `KALUCKA_COLON_CSV`.
+
+```{r kalucka-marker-comparison}
+#| results: asis
+#| fig-width: 15
+#| fig-height: 10
+marker_csv <- Sys.getenv("KALUCKA_COLON_CSV", unset = "Colon marker set table(1).csv")
+if (!file.exists(marker_csv)) {
+  candidates <- c("Colon marker set table.csv", file.path(dirname(knitr::current_input()), "Colon marker set table(1).csv"))
+  candidates <- candidates[file.exists(candidates)]
+  if (length(candidates)) marker_csv <- candidates[[1]]
+}
+if (!file.exists(marker_csv)) stop("Kalucka colon CSV not found. Set KALUCKA_COLON_CSV to its full path.")
+if (!"EC_cluster" %in% names(ec[[]])) stop("EC_cluster metadata missing from existing EC object")
+# Preserve all ranked entries; create separate signatures for each cutoff.
+marker_table <- read.csv(marker_csv, check.names = FALSE, stringsAsFactors = FALSE)
+if (!"Rank" %in% names(marker_table)) stop("CSV must contain a Rank column")
+marker_table$Rank <- suppressWarnings(as.integer(marker_table$Rank))
+marker_table <- marker_table[!is.na(marker_table$Rank), , drop = FALSE]
+marker_table <- marker_table[order(marker_table$Rank), , drop = FALSE]
+marker_columns <- setdiff(names(marker_table), "Rank")
+cutoffs <- c(20L, 50L, 100L)
+clean_genes <- function(v) {
+  v <- trimws(as.character(v))
+  v <- v[!is.na(v) & nzchar(v) & !grepl("^[0-9]{1,2}[-/][A-Za-z]{3}$", v)]
+  unique(v)
+}
+kalucka_sets <- lapply(cutoffs, function(k) {
+  x <- marker_table[marker_table$Rank <= k, , drop = FALSE]
+  setNames(lapply(marker_columns, function(nm) clean_genes(x[[nm]])),
+           make.names(marker_columns))
+})
+names(kalucka_sets) <- paste0("Top", cutoffs)
+marker_counts <- vapply(marker_table[marker_columns], function(x) length(clean_genes(x)), integer(1))
+write.csv(data.frame(subtype=names(marker_counts), available_ranked_markers=unname(marker_counts)),
+          file.path(outdir, "EC_Kalucka_colon_marker_counts.csv"), row.names=FALSE)
+if (any(grepl("Sep", unlist(marker_table[marker_columns]), fixed=TRUE), na.rm=TRUE))
+  cat("NOTE: possible Excel-converted gene symbols are excluded from scoring.\n")
+# Preserve the baseline panel defined above; exclude Pan_EC, Activated and NonEC
+# from subtype-to-subtype scoring, but retain them in the existing DotPlot.
+canonical_subtypes <- marker_sets[intersect(c("Arterial", "Capillary", "Venous", "Lymphatic"), names(marker_sets))]
+
+# Obtain the same RNA data layer for both comparisons; no re-normalization,
+# re-clustering or label transfer is performed here.
+DefaultAssay(ec) <- "RNA"
+rna_data <- tryCatch(SeuratObject::GetAssayData(ec, assay = "RNA", layer = "data"),
+                     error = function(e) stop("Normalized RNA data layer required for Kalucka comparison: ", conditionMessage(e)))
+cluster_ids <- as.character(ec$EC_cluster)
+if (anyNA(cluster_ids)) stop("Missing EC_cluster labels")
+if (ncol(rna_data) != length(cluster_ids) || !identical(colnames(rna_data), colnames(ec))) {
+  stop("RNA data columns and EC cluster labels are not aligned")
+}
+cluster_levels <- if (all(grepl("^[0-9]+$", unique(cluster_ids))))
+  as.character(sort(as.integer(unique(cluster_ids)))) else sort(unique(cluster_ids))
+cluster_fac <- factor(cluster_ids, levels = cluster_levels)
+
+# Average normalized log-expression for each gene within each EC cluster.
+# Per-gene z-scoring across clusters makes expression patterns comparable,
+# but should NOT be interpreted as differential expression or classification accuracy.
+all_sets <- c(setNames(canonical_subtypes, paste0("Current_", names(canonical_subtypes))),
+              unlist(lapply(names(kalucka_sets), function(k) setNames(kalucka_sets[[k]], paste0("Kalucka_", k, "_", names(kalucka_sets[[k]])))), recursive=FALSE))
+all_genes <- unique(unlist(all_sets, use.names = FALSE))
+present <- intersect(all_genes, rownames(rna_data))
+coverage <- do.call(rbind, lapply(names(all_sets), function(nm) {
+  g <- unique(all_sets[[nm]])
+  data.frame(panel = if (startsWith(nm, "Kalucka_")) sub("^Kalucka_(Top[0-9]+)_.*$", "\\1", nm) else "Current",
+             signature = sub("^(Current_|Kalucka_Top[0-9]+_)", "", nm),
+             n_requested = length(g), n_present = sum(g %in% present),
+             n_missing = sum(!g %in% present),
+             missing_genes = paste(setdiff(g, present), collapse = "; "))
+}))
+write.csv(coverage, file.path(outdir, "EC_Kalucka_cutoff_marker_coverage.csv"), row.names = FALSE)
+
+if (length(present) && length(cluster_levels) > 1L) {
+  cluster_cells <- split(seq_along(cluster_ids), cluster_fac, drop = TRUE)
+  # Explicitly build gene x cluster matrix; vapply() may drop dimensions or
+  # column names in corner cases, causing expand.grid() to have zero rows.
+  avg <- do.call(cbind, lapply(cluster_cells, function(idx) {
+    Matrix::rowMeans(rna_data[present, idx, drop = FALSE])
+  }))
+  avg <- matrix(avg, nrow = length(present), ncol = length(cluster_cells),
+                dimnames = list(present, names(cluster_cells)))
+  # Scale each gene across clusters; zero variance genes are assigned zero.
+  z <- t(scale(t(avg)))
+  z[!is.finite(z)] <- 0
+  # pmin()/pmax() can strip matrix dimensions and dimnames in R.
+  # Clip numeric values, then explicitly restore the gene x cluster matrix.
+  z <- matrix(pmax(-2.5, pmin(2.5, as.numeric(z))),
+              nrow = nrow(avg), ncol = ncol(avg),
+              dimnames = dimnames(avg))
+  stopifnot(is.matrix(z), identical(dim(z), dim(avg)),
+            identical(rownames(z), present),
+            identical(colnames(z), names(cluster_cells)))
+
+  # Plot each signature's constituent genes, preserving published rank order.
+  plot_signature_heatmap <- function(sets, panel_name) {
+    dat <- do.call(rbind, lapply(names(sets), function(nm) {
+      genes <- intersect(unique(sets[[nm]]), present)
+      if (!length(genes)) return(NULL)
+      if (!length(colnames(z))) return(NULL)
+      expand <- expand.grid(gene = genes, EC_cluster = colnames(z), stringsAsFactors = FALSE)
+      if (!nrow(expand)) return(NULL)
+      expand$z <- z[cbind(match(expand$gene, rownames(z)), match(expand$EC_cluster, colnames(z)))]
+      expand$signature <- nm
+      expand$gene_rank <- match(expand$gene, genes)
+      expand
+    }))
+    if (is.null(dat) || !nrow(dat)) return(NULL)
+    # Unique gene+signature labels handle genes occurring in multiple panels.
+    dat$gene_label <- paste(dat$signature, dat$gene, sep = " | ")
+    ord <- unique(dat$gene_label[order(match(dat$signature, names(sets)), dat$gene_rank)])
+    dat$gene_label <- factor(dat$gene_label, levels = rev(ord))
+    dat$EC_cluster <- factor(dat$EC_cluster, levels = cluster_levels)
+    ggplot(dat, aes(x = EC_cluster, y = gene_label, fill = z)) +
+      geom_tile() + scale_fill_gradient2(low = "#3B6FB6", mid = "white", high = "#B23B3B",
+                                        midpoint = 0, limits = c(-2.5, 2.5), name = "Gene z") +
+      facet_grid(signature ~ ., scales = "free_y", space = "free_y") +
+      theme_bw(base_size = 10) +
+      theme(axis.text.y = element_text(size = 8), strip.text.y = element_text(angle = 0),
+            panel.spacing.y = grid::unit(0.3, "lines")) +
+      labs(title = panel_name, x = "EC cluster", y = NULL)
+  }
+  current_heatmap <- plot_signature_heatmap(canonical_subtypes, "Current canonical EC subtype markers | cluster-mean gene z-scores")
+  colon_heatmap <- plot_signature_heatmap(kalucka_sets[["Top20"]], "Kalucka colon top 20 | cluster-mean gene z-scores")
+  if (!is.null(current_heatmap)) {
+    pdf(file.path(outdir, "EC_current_marker_heatmap.pdf"), width = 13, height = 8)
+    print(current_heatmap); dev.off()
+  } else cat("No current canonical markers available for heatmap.\n")
+  if (!is.null(colon_heatmap)) {
+    pdf(file.path(outdir, "EC_Kalucka_colon_top20_gene_heatmap.pdf"), width = 15, height = 26)
+    print(colon_heatmap); dev.off()
+  } else cat("No colon reference markers available for heatmap.\n")
+
+  # Equal-weighted average of each signature's constituent gene z-scores.
+  # Scores describe cluster-level relative enrichment; they are not
+  # SingleR predictions, confidence values or direct accuracy measures.
+  score_rows <- do.call(rbind, lapply(names(all_sets), function(nm) {
+    genes <- intersect(unique(all_sets[[nm]]), rownames(z))
+    if (!length(genes) || !ncol(z)) return(NULL)
+    gene_cluster_z <- z[genes, , drop = FALSE]
+    stopifnot(length(dim(gene_cluster_z)) == 2L)
+    data.frame(panel = if (startsWith(nm, "Kalucka_")) sub("^Kalucka_(Top[0-9]+)_.*$", "\\1", nm) else "Current",
+               signature = sub("^(Current_|Kalucka_Top[0-9]+_)", "", nm),
+               EC_cluster = colnames(z),
+               mean_gene_z = base::colMeans(gene_cluster_z),
+               n_genes = length(genes))
+  }))
+  if (is.null(score_rows) || !nrow(score_rows)) {
+    stop("No signature scores could be computed; check marker coverage and EC clusters.")
+  }
+  write.csv(score_rows, file.path(outdir, "EC_Kalucka_cutoff_cluster_signature_scores.csv"), row.names = FALSE)
+  signature_heatmap <- ggplot(score_rows, aes(x = factor(EC_cluster, levels = cluster_levels),
+                                y = signature, fill = mean_gene_z)) +
+          geom_tile() + facet_grid(panel ~ ., scales = "free_y", space = "free_y") +
+          scale_fill_gradient2(low = "#3B6FB6", mid = "white", high = "#B23B3B", midpoint = 0) +
+          theme_bw() + labs(title = "EC cluster signature enrichment | same normalized RNA data",
+                            x = "EC cluster", y = NULL, fill = "Mean gene z")
+  print(signature_heatmap)
+  pdf(file.path(outdir, "EC_Kalucka_cutoff_signature_scores.pdf"), width = 13, height = 9)
+  print(signature_heatmap); dev.off()
+  # Within each panel and cluster, show the leading signature and its
+  # separation from the runner-up (exploratory ambiguity indicator).
+  # Rank explicitly within each panel/cluster. Do not mix signatures across cutoffs.
+  ranking <- dplyr::bind_rows(lapply(split(score_rows, interaction(score_rows$panel,
+                                             score_rows$EC_cluster, drop=TRUE)), function(df) {
+    df <- df[order(-df$mean_gene_z, df$signature), , drop=FALSE]
+    data.frame(panel=df$panel[1], EC_cluster=df$EC_cluster[1],
+      top_signature=df$signature[1], top_score=df$mean_gene_z[1],
+      runner_up=if(nrow(df)>1) df$signature[2] else NA_character_,
+      runner_up_score=if(nrow(df)>1) df$mean_gene_z[2] else NA_real_,
+      score_margin=if(nrow(df)>1) df$mean_gene_z[1]-df$mean_gene_z[2] else NA_real_)
+  }))
+  stopifnot(all(is.na(ranking$score_margin) | ranking$score_margin >= -1e-10))
+  # Stability of the leading Kalucka subtype across 20, 50, and 100.
+  kal_ranks <- ranking[ranking$panel %in% paste0("Top", cutoffs), ]
+  stability <- do.call(rbind, lapply(split(kal_ranks, kal_ranks$EC_cluster), function(df) {
+    df <- df[match(paste0("Top", cutoffs), df$panel), , drop=FALSE]
+    valid <- !is.na(df$top_signature)
+    data.frame(EC_cluster=df$EC_cluster[1],
+      top20=df$top_signature[1], top50=df$top_signature[2],
+      top100=df$top_signature[3],
+      stable_across_cutoffs=all(valid) && length(unique(df$top_signature))==1,
+      min_margin=if(any(valid)) min(df$score_margin[valid], na.rm=TRUE) else NA_real_)
+  }))
+  write.csv(stability, file.path(outdir, "EC_Kalucka_top20_50_100_annotation_stability.csv"), row.names=FALSE)
+  write.csv(ranking, file.path(outdir, "EC_Kalucka_cutoff_cluster_top_signatures.csv"), row.names = FALSE)
+  # Main report: concise, clearly defined table. Keep cutoff diagnostics in CSV.
+  cluster_n <- as.data.frame(table(EC_cluster = cluster_ids), stringsAsFactors=FALSE)
+  names(cluster_n)[2] <- "n_cells"
+  stability <- merge(stability, cluster_n, by="EC_cluster", all.x=TRUE, sort=FALSE)
+  stability <- stability[match(cluster_levels, stability$EC_cluster), , drop=FALSE]
+  stability$review <- ifelse(!stability$stable_across_cutoffs, "Cutoff-dependent",
+                       ifelse(!is.na(stability$min_margin) & stability$min_margin < 0.1,
+                              "Close competing scores", "Consistent across cutoffs"))
+  write.csv(stability, file.path(outdir, "EC_Kalucka_annotation_review_summary.csv"), row.names=FALSE)
+  pretty_label <- function(x) {
+    x <- gsub("\\.", " ", as.character(x))
+    x <- sub("^capillary arterial$", "Arterial capillary", x)
+    x <- sub("^capillary Aqp7 $", "Aqp7+ capillary", x)
+    x <- sub("^vein Madcam1 $", "MAdCAM1+ vein", x)
+    x <- sub("^capillary ([12])$", "Capillary \\1", x)
+    x <- sub("^artery$", "Artery", x)
+    x <- sub("^lymphatic$", "Lymphatic", x)
+    x
+  }
+  reader_tab <- data.frame(
+    `EC cluster`=stability$EC_cluster,
+    `Cells`=as.integer(stability$n_cells),
+    `Top Kalucka colon signature (50 genes)`=pretty_label(stability$top50),
+    `Evidence from 20/50/100-gene comparison`=stability$review,
+    check.names=FALSE)
+  cat("\n\n#### EC subtype signatures: provisional interpretation\n\n")
+  print(knitr::kable(reader_tab, format="html", escape=TRUE, row.names=FALSE,
+    caption="EC cluster is the Seurat reclustering ID; Cells is its size. The signature is the highest-scoring Kalucka colon marker set (top 50 genes), NOT a finalized cell identity. The final column indicates cutoff consistency or a small score margin, NOT statistical confidence."))
+  cat(sprintf("\n\n**Cutoff agreement:** %d/%d EC clusters have the same leading signature with 20, 50, and 100 genes.\n\n",
+              sum(stability$stable_across_cutoffs), nrow(stability)))
+  flagged <- stability$EC_cluster[stability$review != "Consistent across cutoffs"]
+  cat(sprintf("**Manual review priorities:** clusters %s. Compare individual marker expression and competing signatures before final annotation.\n\n",
+              if(length(flagged)) paste(flagged, collapse=", ") else "none flagged by these criteria"))
+} else {
+  cat("Insufficient marker coverage or fewer than two EC clusters; comparison plots skipped.\n")
+}
+
+```
+
+
+**How to interpret this table:** Each row represents a Seurat EC cluster. The marker-set name describes the *best-matching Kalucka colon signature* using 50 genes, not a confirmed cell identity. The evidence column summarizes whether that match persists with 20 and 100 genes; close competing scores are flagged separately. The full cutoff-by-cutoff comparison is exported to CSV, rather than crowding the main report. Agreement is not a probability or independent validation.
+
+**Biological interpretation:** Arterial candidates (clusters 6 and 9),
+MAdCAM1-associated venous candidates (4 and 8), and lymphatic candidates
+(3 and 15) are consistent across tested cutoffs. Several capillary groups
+are likewise stable, including the Aqp7-associated signature in cluster 10.
+Clusters 0, 5, and 13 switch leading signatures across cutoffs; cluster 11
+is stable but has a very narrow score margin. These warrant particular
+scrutiny. Confirm assignments with **individual markers**, co-expression,
+non-endothelial contamination checks, and cluster-specific expression;
+DSS-induced activation must not be mistaken for a stable EC subtype.
+
+
+**Detailed diagnostics:** Full signature scores, ranked first/second
+signatures, marker coverage, and cutoff stability are exported as CSV files
+in the analysis output directory. They are intentionally omitted from the
+PI-facing HTML to avoid redundant tables. No final EC subtype annotation is
+automatically written to the Seurat object.
+
+```{r markers-full}
+#| eval: !expr full
+# detailed report only: top positive markers per EC cluster
+mk <- FindAllMarkers(ec, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.5,
+                     max.cells.per.ident = 500, verbose = FALSE) |>
+  group_by(cluster) |> slice_max(avg_log2FC, n = 8) |> ungroup() |>
+  select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj)
+write.csv(mk, file.path(outdir, "EC_cluster_top_markers.csv"), row.names = FALSE)
+dt(mk, page = 16)
+```
+
+```{r composition-full}
+#| eval: !expr full
+#| fig-width: 12
+#| fig-height: 4.5
+# detailed report only: are any clusters library- or day-specific?
+cmp <- ec[[]] |> count(EC_cluster, library_id) |> group_by(EC_cluster) |> mutate(percent = 100 * n / sum(n))
+ggplot(cmp, aes(EC_cluster, percent, fill = library_id)) + geom_col() + theme_bw() +
+  labs(title = "Library composition of each EC cluster", x = "EC cluster", y = "%")
+```
+
+## 7. Exports
+
+```{r exports}
+final_rds <- file.path(outdir, "NIAID1468_EC_annotated_pre_post_SingleR_MCA.rds")
+# Re-save unless an existing final RDS is fully readable AND carries the columns Step 2 needs.
+# (Previously any existing file blocked the save, so a truncated file was never replaced.)
+final_valid <- function(p) {
+  x <- read_rds_ok(p)
+  ok <- inherits(x, "Seurat") && all(c("EC_cluster", "post_MCA_pruned") %in% colnames(x[[]]))
+  rm(x); invisible(gc(verbose = FALSE)); ok
+}
+if (rebuilt || params$force_annotation || !file.exists(final_rds) || !final_valid(final_rds)) {
+  save_rds_atomic(ec, final_rds)
+  message("Saved ", final_rds, " (", round(file.size(final_rds) / 2^20), " MB, verified by full read-back)")
+}
+write.csv(data.frame(cell = colnames(ec), ec[[]], check.names = FALSE),
+          file.path(outdir, "EC_annotation_metadata_pre_post.csv"), row.names = FALSE)
+dt(data.frame(file = c(basename(final_rds), "EC_annotation_metadata_pre_post.csv",
+                       "EC_selection_audit.csv", "checkpoint_EC.rds"), dir = outdir), page = 5)
+```
+
+```{r session}
+#| eval: !expr full
+sessionInfo()
+```
