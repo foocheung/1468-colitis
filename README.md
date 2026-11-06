@@ -27,6 +27,10 @@ The analysis report is intended to provide supporting evidence for PI annotation
 ### Next Steps
 
 1. Confirm DSS day assignments and sample metadata.
+   Resolve the discrepancy in DSS day assignments between the two original sources:
+TAS (original study request): D0, D3, D7, D9, D14, D21.
+Excel sample key (NIAID-1468_GTU_Sample_Key.xlsx): D0, D3A, D3B, D5, D7A, D7B, D14, D21.
+The discrepancy concerns LIB_16190, assigned to D9 in the TAS but D5 in the Excel sample key. Confirm the correct collection day with the PI before downstream DSS time-course analysis.
 2. Review candidate endothelial subtype identities with the PI and finalize the cluster-to-subtype annotation mapping.
 3. Update the Seurat object with the agreed endothelial annotations.
 4. Compare endothelial cell proportions across DSS time points to identify changes during inflammation and recovery.
@@ -38,7 +42,7 @@ The analysis report is intended to provide supporting evidence for PI annotation
 
 **Step 1: QC, HTO Demultiplexing, and Endothelial Annotation**
 
-[View HTML Report on GitHub](https://github.com/foocheung/1468-colitis/blob/main/Reports/NIAID1468_01_QC_annotation_PI_first_pass_v4.html)
+[View HTML Report on GitHub](https://github.com/foocheung/1468-colitis/blob/main/Reports/NIAID1468_01_QC_annotation_PI_first_pass_v10_clear_EC_summary.html)
 
 To view the report correctly, download the HTML file from GitHub and open it locally in a web browser (Chrome, Firefox, or Safari). GitHub does not render the interactive HTML report directly.
 
