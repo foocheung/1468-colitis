@@ -1,4 +1,4 @@
-## 1468: DSS Colitis Endothelial scRNA-seq
+## 1468
 
 ### Analysis Completed to Date (November 2026)
 
