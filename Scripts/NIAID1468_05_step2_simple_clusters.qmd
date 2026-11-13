@@ -1,0 +1,535 @@
+---
+title: "NIAID-1468 | Step 2 — EC subtypes, differential expression and pathways"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+  error: false
+params:
+  ec_rds: "/vf/users/cheungf/NIAID-1468-colitis/NIAID-1468/cellseek_execution/seurat/analysis/01_QC_annotations/NIAID1468_EC_annotated_pre_post_SingleR_MCA.rds"
+  output_dir: "/vf/users/cheungf/NIAID-1468-colitis/NIAID-1468/cellseek_execution/seurat/analysis/05_EC_step2"
+  cluster_col: "EC_cluster"   # cluster column written by Step 1 (older Step 1 objects: "RNA_snn_res.0.6")
+  test_cells_per_mouse: 0   # >0 = quick test: random subset of up to N cells per mouse, writes to <output_dir>_TEST; 0 = ALL cells
+  annotation_csv: "" # CSV with cluster,EC_subtype (Step 1 writes ..._clusters_template.csv and ..._kalucka_template.csv; edit then pass). Empty = C<EC_cluster>
+  run_label: ""      # e.g. "clusters" or "kalucka": appended to output_dir so each labelling gets its own report/results folder
+  min_cells_pb: 30
+  min_mice_per_day: 2
+  min_count: 10               # min.count for edgeR::filterByExpr (renamed from min_genes_expressed)
+  min_lfc: 0.5
+  fdr: 0.05
+  ambient_regex: "^Ig[hkl]|^Jchain$|^Mzb1$|^Hb[ab]-|^mt-"
+  run_gsea: true
+  gsea_dbs: ["Hallmark", "Reactome"]   # test mode forces Hallmark only
+  force_recompute: false
+  allow_fallback: false       # TRUE = debug-only: may use an unintegrated Step 1 checkpoint if the annotated RDS is unreadable
+---
+
+## Scientific questions and analysis approach
+
+The collaborators' primary question is **how DSS-induced colitis changes colonic endothelial-cell (EC) subtypes and their properties over time**. Their October 28 correspondence identifies the following priorities:
+
+1. **Which colon EC subtypes are present?** Review the integrated EC clusters and published marker genes to annotate the endothelial populations.
+2. **How does the representation of each EC subtype change through DSS colitis?** Examine mouse-level subtype proportions across the recorded time points.
+3. **Are there inflammation-associated EC populations or states?** Look for subtype shifts together with inflammatory transcriptional changes. An activated state within an existing subtype should not automatically be called a new subtype.
+4. **Which genes and functions change during inflammation and recovery?** Compare each subtype at later time points with D0 using mouse-level pseudobulk differential expression, then evaluate Hallmark and Reactome gene sets as functional evidence.
+5. **Does immune–endothelial communication change?** The collaborators propose CellChat with macrophages, monocytes, neutrophils and other immune cells if immune-cell data become available. This is **future work**, not an analysis performed in this report.
+
+**Report scope:** EC annotation, subtype proportions, subtype-specific differential expression, and pathway enrichment. The conclusions below summarize these outputs without claiming that expression alone establishes a new cell lineage or a causal mechanism.
+
+## Study design and interpretation
+
+**Step 2**, downstream of `NIAID1468_01_QC_annotation_PI_first_pass_v11_clear_EC_summary.qmd`. It loads the annotated EC object from Step 1 and does not rerun QC, SingleR, MCA or reclustering. The replicate is the **mouse** (library × HTO), not the cell.
+
+::: {.callout-important}
+## Read before interpreting
+- **Day and library are largely confounded.** D0, D5, D14 and D21 each come from one library; only D3 and D7 have two. A day-vs-D0 result is *day-associated*, not shown to be caused by DSS. Interpret day-associated changes cautiously.
+- **D5 vs D9:** LIB_16190 is D5 per the sample key; the TAS says D9. Confirm before publication.
+- **Subtype labels are provisional** (`C<cluster>`) unless `annotation_csv` is supplied. Review them against Step 1 markers.
+:::
+
+**Outputs:** mouse-level subtype proportions, day-versus-D0 pseudobulk differential expression, and Hallmark/Reactome pathway enrichment.
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(Seurat); library(SeuratObject); library(Matrix)
+  library(dplyr); library(tidyr); library(ggplot2); library(knitr)
+  library(edgeR); library(limma); library(DT)
+})
+P <- params                      # working copy: test mode below changes a few settings
+if (nzchar(P$run_label)) P$output_dir <- paste0(sub("/+$", "", P$output_dir), "_", P$run_label)
+test <- P$test_cells_per_mouse > 0
+if (test) {
+  P$output_dir <- paste0(sub("/+$", "", P$output_dir), "_TEST")   # never touches real outputs/caches
+  P$min_cells_pb <- 5; P$min_count <- 1; P$gsea_dbs <- "Hallmark"
+}
+dt <- function(x, digits = 3, page = 10, ...) {
+  x <- as.data.frame(x)
+  w <- DT::datatable(x, rownames = FALSE, filter = "top", extensions = "Buttons", ...,
+    options = list(pageLength = page, scrollX = TRUE, dom = "Bfrtip", buttons = c("csv", "excel")))
+  sci <- intersect(c("PValue", "P.Value", "FDR", "padj", "pval", "p_val_adj"), names(x))
+  num <- setdiff(names(x)[vapply(x, is.double, logical(1))], sci)
+  if (length(num)) w <- DT::formatRound(w, num, digits)
+  if (length(sci)) w <- DT::formatSignif(w, sci, 3)
+  w
+}
+# per-chunk timing, printed to the console while rendering
+knitr::knit_hooks$set(timer = function(before, options) {
+  if (before) assign(".t0", Sys.time(), envir = globalenv())
+  else message(sprintf("[TIMER] %-20s %6.1f min", options$label,
+                       as.numeric(difftime(Sys.time(), get(".t0", globalenv()), units = "mins"))))
+})
+knitr::opts_chunk$set(timer = TRUE)
+set.seed(1468)
+outdir <- P$output_dir
+dir.create(outdir, recursive=TRUE, showWarnings=FALSE)
+cache_dir <- file.path(outdir, "cache")
+dir.create(cache_dir, recursive=TRUE, showWarnings=FALSE)
+cache_sig <- "unset"   # set once the EC object, cluster map and parameters are final (see below)
+cache <- function(name, compute) {
+  p <- file.path(cache_dir, paste0(name,"_",cache_sig,".rds"))
+  if (file.exists(p) && !isTRUE(P$force_recompute)) {
+    message("Loading cached ",name," — delete cache or set force_recompute=true if input/parameters changed")
+    return(readRDS(p))
+  }
+  x <- compute(); saveRDS(x,p); x
+}
+write_csv <- function(x,name) write.csv(x,file.path(outdir,name),row.names=FALSE,na="")
+key <- data.frame(
+  library_id=paste0("LIB_",c(15875,15876,15877,16186,16187,16188,16189,16190)),
+  sample_name=c("Day3B","Day7A","Day3A","Day14","Day7B","Day0","Day21","Day5"))
+key$day_num <- as.integer(sub("^Day([0-9]+).*","\\1",key$sample_name))
+key$DSS_day <- paste0("D",key$day_num)
+day_levels <- paste0("D",sort(unique(key$day_num)))   # numeric order: D0, D3, D5, D7, D14, D21
+contrast_levels <- paste(setdiff(day_levels,"D0"),"vs D0")
+ord_contrast <- function(x) factor(as.character(x),levels=contrast_levels)   # day-ordered contrast factor
+# Read the Step 1 annotated object; recover from an unreadable RDS using an EC checkpoint.
+# The fallback is explicit: it may not contain post-SingleR/MCA annotations.
+.t <- Sys.time()
+read_ec <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  tryCatch(readRDS(path), error = function(e) {
+    warning("Cannot read EC RDS: ", path, " (", conditionMessage(e), ")")
+    NULL
+  })
+}
+ec <- read_ec(P$ec_rds)
+used_fallback <- NA_character_
+if (is.null(ec) && !isTRUE(P$allow_fallback))
+  stop("Step 1 annotated RDS is missing or unreadable: ", P$ec_rds,
+       "\nRe-save the Step 1 object, or set allow_fallback: true for a debug-only run on an unintegrated checkpoint.")
+if (is.null(ec)) {
+  step1_dir <- dirname(P$ec_rds)
+  candidates <- c(
+    file.path(step1_dir, "checkpoint_EC.rds"),
+    file.path(step1_dir, "checkpoint_EC_unintegrated.rds"),
+    file.path(dirname(step1_dir), "04_EC_dynamics", "checkpoint_EC_reclustered.rds")
+  )
+  for (candidate in candidates) {
+    ec <- read_ec(candidate)
+    if (!is.null(ec)) {
+      warning("Using EC clustering checkpoint instead of final annotated RDS: ", candidate,
+              ". Post-SingleR/MCA fields may be absent; review subtype labels.")
+      used_fallback <- candidate
+      break
+    }
+  }
+  if (is.null(ec)) stop("No readable EC object found. Repair/re-save Step 1 RDS or its checkpoint first.")
+}
+stopifnot(inherits(ec,"Seurat"))
+# Older EC checkpoints may not have the Step 1 convenience cluster column.
+if (!P$cluster_col %in% colnames(ec[[]])) {
+  alternatives <- grep("^RNA_snn_res\\.", colnames(ec[[]]), value = TRUE)
+  if (length(alternatives)) {
+    chosen <- if ("RNA_snn_res.0.6" %in% alternatives) "RNA_snn_res.0.6" else tail(alternatives, 1L)
+    warning("Cluster column '", P$cluster_col, "' missing; using '", chosen, "' from checkpoint.")
+    P$cluster_col <- chosen
+  }
+}
+# keep only what this report uses: RNA counts/data, UMAPs, metadata
+ec <- DietSeurat(ec, assays = "RNA", layers = setdiff(Layers(ec[["RNA"]]), "scale.data"),
+                 dimreducs = intersect(c("umap_unint","umap_harmony","umap","umap_merged"), Reductions(ec)),
+                 graphs = NULL)
+if (test) {
+  set.seed(1468)
+  mk <- if ("mouse_id" %in% colnames(ec[[]])) as.character(ec$mouse_id) else paste(ec$library_id, ec$HTO_classification, sep = "_")
+  keep_cells <- unlist(lapply(split(colnames(ec), mk), function(v) sample(v, min(length(v), P$test_cells_per_mouse))))
+  ec <- subset(ec, cells = keep_cells)
+}
+message(sprintf("[TIMER] setup: load/subset %6.1f min", as.numeric(difftime(Sys.time(), .t, units = "mins"))))
+stopifnot(P$cluster_col %in% colnames(ec[[]]))
+DefaultAssay(ec) <- "RNA"
+if (length(Layers(ec[["RNA"]],search="^counts"))>1L) ec <- JoinLayers(ec,assay="RNA")
+counts <- LayerData(ec,assay="RNA",layer="counts")
+stopifnot(ncol(counts)==ncol(ec), identical(colnames(counts),colnames(ec)))
+# Pseudobulk needs RAW counts: check a sample of non-zero entries is non-negative and integer-valued
+if (inherits(counts, "dgCMatrix")) { nz <- counts@x[seq_len(min(length(counts@x), 1e5))]
+  if (any(nz < 0) || any(abs(nz - round(nz)) > 1e-6))
+    stop("RNA 'counts' layer in the Step 1 RDS is not raw integer counts; pseudobulk/edgeR would be invalid.") }
+md <- ec[[]]
+if (!"library_id" %in% names(md)) stop("Step 1 EC object lacks library_id")
+ix <- match(as.character(md$library_id),key$library_id)
+if (anyNA(ix)) stop("Unknown library IDs: ",paste(unique(md$library_id[is.na(ix)]),collapse=","))
+md$DSS_day_step1 <- if ("DSS_day" %in% names(md)) as.character(md$DSS_day) else NA_character_
+md$DSS_day <- key$DSS_day[ix]
+# The day key above is hardcoded; confirm it agrees with the DSS_day Step 1 stored in the RDS (read-only check).
+if (any(!is.na(md$DSS_day_step1)) && any(md$DSS_day_step1 != md$DSS_day, na.rm = TRUE)) {
+  bad <- unique(md[which(md$DSS_day_step1 != md$DSS_day), c("library_id","DSS_day_step1","DSS_day")])
+  stop("Day key in Step 2 disagrees with DSS_day stored by Step 1:\n", paste(capture.output(print(bad)), collapse = "\n"))
+}
+md$day_num <- key$day_num[ix]
+md$DSS_day <- factor(md$DSS_day,levels=day_levels)   # factor in numeric day order so every plot/table sorts D0,D3,D5,D7,D14,D21
+md$sample_name <- key$sample_name[ix]
+if (!"mouse_id" %in% names(md) || anyNA(md$mouse_id)) {
+  if (!"HTO_classification" %in% names(md)) stop("Need mouse_id or HTO_classification in Step 1 metadata")
+  md$mouse_id <- paste(md$library_id,as.character(md$HTO_classification),sep="_")
+}
+md$mouse_id <- as.character(md$mouse_id)
+if (anyNA(md$mouse_id) || any(!nzchar(md$mouse_id))) stop("Missing mouse IDs")
+md$cluster <- as.character(md[[P$cluster_col]])
+md$EC_subtype <- paste0("C",md$cluster)
+if (nzchar(P$annotation_csv)) {
+  if (!file.exists(P$annotation_csv)) stop("annotation_csv not found: ",P$annotation_csv)
+  anno <- read.csv(P$annotation_csv,stringsAsFactors=FALSE)
+  stopifnot(all(c("cluster","EC_subtype") %in% names(anno)),!anyDuplicated(anno$cluster))
+  if (!all(unique(md$cluster) %in% anno$cluster)) stop("annotation_csv does not cover all EC clusters")
+  md$EC_subtype <- anno$EC_subtype[match(md$cluster,anno$cluster)]
+  if (anyNA(md$EC_subtype) || any(!nzchar(md$EC_subtype))) stop("Missing EC_subtype annotation")
+}
+ec$DSS_day <- factor(md$DSS_day,levels=day_levels)
+ec$day_num <- md$day_num
+ec$mouse_id <- md$mouse_id
+ec$EC_subtype <- md$EC_subtype
+mouse_meta <- distinct(md,mouse_id,library_id,DSS_day,day_num,sample_name)
+if (anyDuplicated(mouse_meta$mouse_id)) stop("mouse_id maps to multiple libraries/days")
+mouse_meta <- arrange(mouse_meta,day_num,library_id,mouse_id)
+subtypes <- sort(unique(md$EC_subtype))
+# cache signature: input object, cluster->subtype map and every parameter the cached steps depend on
+.f <- if (is.na(used_fallback)) P$ec_rds else used_fallback
+.sig_txt <- c(.f, unlist(lapply(file.info(.f)[c("size","mtime")], as.character)), P$cluster_col, ncol(ec),
+  sort(unique(paste(md$cluster, md$EC_subtype))),
+  P$min_cells_pb, P$min_mice_per_day, P$min_count, P$min_lfc, P$fdr, P$ambient_regex, test, P$test_cells_per_mouse)
+.sig_file <- tempfile(); writeLines(as.character(.sig_txt), .sig_file)
+cache_sig <- substr(unname(tools::md5sum(.sig_file)), 1, 8); unlink(.sig_file)
+message("Cache signature: ", cache_sig, "  (cache files are specific to input + parameters)")
+write_csv(mouse_meta,"mouse_metadata.csv")
+write_csv(distinct(md,cluster,EC_subtype),"cluster_to_subtype_used.csv")
+cat("Subtype source:", if (nzchar(P$annotation_csv)) paste("annotation_csv =", P$annotation_csv) else "none supplied -> provisional C<EC_cluster> labels from the Step 1 RDS", "\n")
+cat("EC cells:",ncol(ec),"| mice:",nrow(mouse_meta),"| subtypes:",length(subtypes),"\n")
+dt(count(mouse_meta,DSS_day,library_id), page = 8)
+```
+
+```{r test-banner}
+#| output: asis
+if (test) cat("::: {.callout-warning}\n**TEST RUN:** up to", P$test_cells_per_mouse, "cells per mouse (", ncol(ec),
+  "cells). Proportions and DE are for debugging only. Use `-P test_cells_per_mouse:0` for the real analysis.\n:::\n")
+```
+
+## 1. Subtype analysis
+
+```{r cluster-table}
+dt(count(md,cluster,EC_subtype,sort=TRUE), page = 15)
+```
+
+Clusters dominated by one library are likely batch-driven, and given the day/library confounding they are also day-driven. Treat any cluster with a high top-library fraction with caution.
+
+```{r cluster-library}
+lib_comp <- md %>% count(cluster,EC_subtype,library_id) %>% group_by(cluster,EC_subtype) %>%
+  mutate(frac=n/sum(n)) %>%
+  summarise(n_cells=sum(n), top_library=library_id[which.max(frac)], top_library_fraction=max(frac),
+            effective_n_libraries=1/sum(frac^2), .groups="drop") %>%
+  mutate(single_library_flag=top_library_fraction>0.7) %>% arrange(desc(top_library_fraction))
+write_csv(lib_comp,"cluster_library_composition.csv")
+dt(lib_comp, page = 16)
+```
+
+```{r annotation-audit, fig.width=12, fig.height=6}
+for (field in intersect(c("post_SingleR_pruned","post_MCA_pruned","pre_SingleR_pruned","pre_MCA_pruned"),names(md))) {
+  t <- as.data.frame(table(subtype=md$EC_subtype,label=as.character(md[[field]]),useNA="ifany"))
+  write_csv(t,paste0("annotation_",field,"_by_subtype.csv"))
+}
+red <- intersect(c("umap_unint","umap_harmony","umap","umap_merged"),Reductions(ec))
+if (length(red)) {
+  print(DimPlot(ec,reduction=red[1],group.by="EC_subtype",label=TRUE,raster=TRUE)+ggtitle("EC subtypes (provisional unless manually reviewed)"))
+  print(DimPlot(ec,reduction=red[1],group.by="DSS_day",raster=TRUE)+ggtitle("EC UMAP by DSS day"))
+}
+markers <- list(Pan_EC=c("Pecam1","Cdh5","Kdr","Vwf"),Arterial=c("Gja5","Efnb2","Sox17"),
+  Venous=c("Ackr1","Nr2f2","Vcam1"),Capillary=c("Emcn","Plvap","Rgcc","Car4"),
+  Lymphatic=c("Prox1","Lyve1","Pdpn","Flt4"),Activated=c("Icam1","Sele","Selp","Cxcl10"),
+  NonEC=c("Ptprc","Epcam","Col1a1","Dcn"))
+seen <- character(); markers_unique <- lapply(markers,function(v) {v <- setdiff(intersect(v,rownames(ec)),seen);seen <<- c(seen,v);v})
+markers_unique <- markers_unique[lengths(markers_unique)>0]
+if (length(markers_unique)) print(DotPlot(ec,features=markers_unique,group.by="EC_subtype",assay="RNA")+RotatedAxis())
+```
+
+## 2. Subtype
+
+Fractions are calculated among retained EC cells for each mouse, including zero-count subtypes. **Propeller** (`speckle`, arcsine-square-root transformation with moderated testing) is the sole statistical test of subtype proportion differences for each DSS day versus D0. Each mouse is a biological replicate. Results are exploratory because day and library are largely confounded.
+
+```{r proportions, fig.width=13, fig.height=8}
+N <- as.data.frame(table(mouse_id=factor(md$mouse_id,levels=mouse_meta$mouse_id),EC_subtype=factor(md$EC_subtype,levels=subtypes)))
+names(N)[3] <- "n_cells"
+N <- left_join(N,mouse_meta,by="mouse_id")
+N$DSS_day <- factor(as.character(N$DSS_day),levels=day_levels)
+N <- N %>% group_by(mouse_id) %>% mutate(total_EC=sum(n_cells),fraction=n_cells/total_EC) %>% ungroup()
+stopifnot(all(N$total_EC>0))
+write_csv(N,"EC_subtype_proportions_per_mouse.csv")
+print(ggplot(N,aes(DSS_day,fraction,colour=library_id))+geom_boxplot(aes(group=DSS_day),outlier.shape=NA,colour="grey65")+
+  geom_jitter(width=.14,height=0,size=1.7)+facet_wrap(~EC_subtype,scales="free_y")+theme_bw()+labs(y="Fraction of EC per mouse"))
+print(ggplot(N,aes(mouse_id,fraction,fill=EC_subtype))+geom_col()+facet_grid(~DSS_day,scales="free_x",space="free_x")+
+  theme_bw()+theme(axis.text.x=element_text(angle=90,vjust=.5,hjust=1,size=7)))
+```
+
+```{r proportion-summary}
+prop_summary <- N %>% group_by(EC_subtype,DSS_day) %>% summarise(mean_fraction=mean(fraction),median_fraction=median(fraction),
+  n_mice=n(),n_libraries=n_distinct(library_id),.groups="drop")
+write_csv(prop_summary,"EC_proportion_summary_by_day.csv")
+```
+
+```{r propeller}
+prop_pr <- data.frame()
+if (requireNamespace("speckle",quietly=TRUE)) {
+  ok_days <- intersect(day_levels, names(which(table(mouse_meta$DSS_day)>=P$min_mice_per_day)))
+  if ("D0" %in% ok_days && length(ok_days)>=2) {
+    mm <- filter(mouse_meta, DSS_day %in% ok_days)
+    cells_ok <- md$mouse_id %in% mm$mouse_id
+    pr <- speckle::getTransformedProps(clusters=md$EC_subtype[cells_ok], sample=md$mouse_id[cells_ok], transform="asin")
+    g <- factor(mm$DSS_day[match(colnames(pr$TransformedProps),mm$mouse_id)], levels=ok_days)
+    design <- model.matrix(~0+g); colnames(design) <- levels(g)
+    prop_pr <- bind_rows(lapply(setdiff(levels(g),"D0"), function(day) {
+      ct <- setNames(rep(0,ncol(design)),colnames(design)); ct[day] <- 1; ct["D0"] <- -1
+      r <- speckle::propeller.ttest(pr, design, contrasts=ct, robust=TRUE, trend=FALSE, sort=FALSE)
+      r$EC_subtype <- rownames(r); r$contrast <- paste(day,"vs D0"); r
+    }))
+    write_csv(prop_pr,"EC_proportion_day_vs_D0_propeller.csv")
+    dt(arrange(prop_pr,P.Value))
+  }
+} else stop("Section 2 requires the speckle package for propeller proportion testing.")
+```
+
+```{r pseudobulk-build, include=FALSE}
+make_pb <- function(label) {
+  cells <- if (label=="All_EC") seq_len(ncol(ec)) else which(md$EC_subtype==label)
+  ids <- factor(md$mouse_id[cells],levels=mouse_meta$mouse_id)
+  X <- Matrix::sparse.model.matrix(~0+ids)
+  colnames(X) <- levels(ids)
+  agg <- counts[,cells,drop=FALSE] %*% X
+  present <- colSums(X)>0
+  agg <- agg[,present,drop=FALSE]
+  m <- mouse_meta[match(colnames(agg),mouse_meta$mouse_id),,drop=FALSE]
+  m$n_cells <- as.integer(colSums(X)[present]);m$subtype <- label
+  list(counts=agg,meta=m)
+}
+pb <- cache("pseudobulk_counts_v1",function() setNames(lapply(c("All_EC",subtypes),make_pb),c("All_EC",subtypes)))
+pb_meta <- bind_rows(lapply(pb,function(x)x$meta))
+write_csv(pb_meta,"pseudobulk_sample_sizes.csv")
+dt(pb_meta %>% group_by(subtype,DSS_day) %>% summarise(mice_usable=sum(n_cells>=P$min_cells_pb),
+  cells=sum(n_cells),.groups="drop"))
+```
+
+## 3. Day-versus-D0 differential expression (edgeR QL / TREAT)
+
+Per subtype and for All_EC, days with at least `min_mice_per_day` usable mice are included. Model `~0 + DSS_day` (no library covariate: day and library are not separable for most days). With `min_lfc > 0`, `glmTreat` tests against that log2FC threshold. Reported: P values and within-contrast BH FDR. `replicate_library_concordant` is evaluable only for D3 and D7 (two libraries) and is `NA` elsewhere. `rank_stat` is the unthresholded signed QL statistic used for GSEA.
+
+```{r pseudobulk-de}
+run_de <- function(label) {
+  a <- pb[[label]]; m <- a$meta
+  keep <- m$n_cells>=P$min_cells_pb
+  m <- m[keep,,drop=FALSE]; cnt <- a$counts[,keep,drop=FALSE]
+  nday <- table(factor(m$DSS_day,levels=day_levels))
+  valid <- names(nday)[nday>=P$min_mice_per_day]
+  if (!("D0" %in% valid) || length(valid)<2) return(list(status=data.frame(subtype=label,status="Insufficient mice/day",mice=nrow(m)),results=NULL))
+  keep <- m$DSS_day %in% valid;m <- m[keep,,drop=FALSE];cnt <- cnt[,keep,drop=FALSE]
+  cnt <- cnt[!grepl(P$ambient_regex,rownames(cnt)),,drop=FALSE]
+  g <- factor(as.character(m$DSS_day),levels=valid)
+  y <- DGEList(counts=cnt,group=g)
+  ok <- filterByExpr(y,group=g,min.count=P$min_count)
+  if (sum(ok)<100) return(list(status=data.frame(subtype=label,status="Too few expressed genes",mice=nrow(m)),results=NULL))
+  y <- y[ok,,keep.lib.sizes=FALSE];y <- calcNormFactors(y)
+  design <- model.matrix(~0+g);colnames(design)<-levels(g)
+  if (nrow(design)<=qr(design)$rank) return(list(status=data.frame(subtype=label,status="No residual degrees of freedom",mice=nrow(m)),results=NULL))
+  y <- estimateDisp(y,design)
+  fit <- glmQLFit(y,design,robust=TRUE)
+  lcpm <- cpm(y,log=TRUE,prior.count=2)
+  result <- lapply(setdiff(valid,"D0"),function(day) {
+    ct <- setNames(rep(0,ncol(design)),colnames(design));ct[day]<-1;ct["D0"]<--1
+    test <- if (P$min_lfc>0) glmTreat(fit,contrast=ct,lfc=P$min_lfc) else glmQLFTest(fit,contrast=ct)
+    tt <- topTags(test,n=Inf,sort.by="none")$table
+    tt$gene <- rownames(tt);tt$subtype <- label;tt$contrast <- paste(day,"vs D0")
+    # unthresholded signed QL statistic for GSEA ranking (TREAT P values are thresholded and compress the ranks)
+    qlt <- if (P$min_lfc>0) glmQLFTest(fit,contrast=ct) else test
+    qtab <- qlt$table
+    tt$rank_stat <- (sign(qtab$logFC)*sqrt(pmax(qtab$F,0)))[match(tt$gene,rownames(qtab))]
+    tt$n_mice_day <- unname(nday[day]);tt$n_mice_D0 <- unname(nday["D0"])
+    libs <- unique(as.character(m$library_id[m$DSS_day==day]))
+    tt$replicate_library_concordant <- NA
+    if (length(libs)>=2) {
+      d0 <- rowMeans(lcpm[,m$DSS_day=="D0",drop=FALSE])
+      a1 <- rowMeans(lcpm[,m$library_id==libs[1],drop=FALSE])-d0
+      a2 <- rowMeans(lcpm[,m$library_id==libs[2],drop=FALSE])-d0
+      tt$replicate_library_concordant <- (sign(a1[tt$gene])==sign(a2[tt$gene])) &
+        (sign(a1[tt$gene])==sign(tt$logFC))
+    }
+    tt
+  })
+  list(status=data.frame(subtype=label,status="Tested",mice=nrow(m)),results=bind_rows(result),
+       logcpm=lcpm,meta=m)
+}
+de <- cache("pseudobulk_DE_v2",function() lapply(names(pb),run_de) |> setNames(names(pb)))
+status <- bind_rows(lapply(de,`[[`,"status"))
+write_csv(status,"pseudobulk_DE_testability.csv")
+de_res <- bind_rows(lapply(de,function(x)x$results))
+if (nrow(de_res)) {
+  de_res$contrast <- ord_contrast(de_res$contrast)   # day-ordered facets, tables and CSV grouping
+  write_csv(de_res,"pseudobulk_DE_day_vs_D0_all_subtypes.csv")
+  de_counts <- de_res %>% group_by(subtype,contrast) %>% summarise(
+    tested=n(),up=sum(FDR<P$fdr & logFC>0),down=sum(FDR<P$fdr & logFC<0),
+    replicate_concordant_sig=if (all(is.na(replicate_library_concordant))) NA_integer_ else sum(FDR<P$fdr & replicate_library_concordant %in% TRUE),.groups="drop")
+  write_csv(de_counts,"DEG_counts_by_subtype_day.csv")
+  dt(de_counts)
+} else cat("No testable contrasts; inspect pseudobulk_DE_testability.csv\n")
+```
+
+```{r DEG-figures, results='asis', fig.width=13, fig.height=7}
+if (nrow(de_res)) {
+  volcano <- de_res %>% mutate(neglogP=-log10(pmax(PValue,1e-300)))
+  labels <- volcano %>% filter(FDR<P$fdr, logFC>0) %>%
+    group_by(subtype,contrast) %>% slice_max(logFC,n=10,with_ties=FALSE) %>% ungroup()
+  if (!requireNamespace("ggrepel",quietly=TRUE))
+    warning("Install ggrepel to display the top-10 volcano gene labels.")
+  .volcano_plots <- list()
+  for (st in unique(as.character(volcano$subtype))) {
+    v <- filter(volcano,subtype==st)
+    lab <- filter(labels,subtype==st)
+    g <- ggplot(v,aes(logFC,neglogP,colour=FDR<P$fdr)) +
+      geom_point(size=.5,alpha=.7) + facet_wrap(~contrast) + theme_bw() +
+      labs(x="log2 fold change",y="-log10(P)",title=paste(st,"day versus D0"))
+    if (nrow(lab) && requireNamespace("ggrepel",quietly=TRUE))
+      g <- g + ggrepel::geom_text_repel(data=lab,aes(label=gene),size=2.8,
+                                       max.overlaps=Inf,show.legend=FALSE)
+    .volcano_plots[[st]] <- g
+  }
+  write_csv(labels,"top10_positive_logFC_DEGs_each_subtype_contrast.csv")
+  cat("::: {.panel-tabset}\n\n")
+  for (i in seq_along(.volcano_plots)) {
+    st <- names(.volcano_plots)[i]
+    cat("### ",st,"\n\n",sep="")
+    child <- paste0("```{r echo=FALSE, fig.width=13, fig.height=7}\n",
+                    "print(.volcano_plots[[",i,"]])\n```\n")
+    cat(knitr::knit_child(text=child, envir=environment(), quiet=TRUE),sep="\n")
+    cat("\n\n")
+  }
+  cat(":::\n\n")
+}
+```
+
+
+## 4. Gene-set enrichment: Hallmark and Reactome (per subtype × day)
+
+fgsea is run per subtype × day-vs-D0 contrast on the **unthresholded signed QL statistic** (`rank_stat`), so TREAT thresholding does not compress the ranking. Gene-set FDR is within subtype × contrast. Mouse-native MSigDB sets (`db_species = "MM"`) are used. `msigdbr` and `fgsea` are optional.
+
+```{r pathway-gsea}
+gsea_res <- data.frame()
+if (isTRUE(P$run_gsea) && nrow(de_res) && requireNamespace("fgsea",quietly=TRUE) && requireNamespace("msigdbr",quietly=TRUE)) {
+  fetch_sets <- function(collection,subcollection=NULL) {
+    args <- list(species="Mus musculus",collection=collection)
+    if (!is.null(subcollection)) args$subcollection <- subcollection
+    x <- tryCatch(do.call(msigdbr::msigdbr,c(args,list(db_species="MM"))),
+                  error=function(e) tryCatch(do.call(msigdbr::msigdbr,args),error=function(e2) NULL))
+    if (is.null(x) || !nrow(x)) return(list())
+    split(unique(x[,c("gs_name","gene_symbol")])$gene_symbol,unique(x[,c("gs_name","gene_symbol")])$gs_name)
+  }
+  set_fns <- list(Hallmark=function() fetch_sets("H"),Reactome=function() fetch_sets("C2","CP:REACTOME"))
+  sets <- lapply(set_fns[intersect(names(set_fns),P$gsea_dbs)],function(f) f())
+  gs <- lapply(names(sets),function(db) {
+    pathways <- sets[[db]]
+    if (!length(pathways)) return(NULL)
+    lapply(split(de_res,interaction(de_res$subtype,de_res$contrast,drop=TRUE)),function(a) {
+      ranks <- if ("rank_stat" %in% names(a)) a$rank_stat else sign(a$logFC)*-log10(pmax(a$PValue,1e-300))
+      names(ranks) <- a$gene
+      ranks <- sort(ranks[is.finite(ranks)&!duplicated(names(ranks))],decreasing=TRUE)
+      if (length(ranks)<100) return(NULL)
+      res <- fgsea::fgseaMultilevel(pathways=pathways,stats=ranks,minSize=10,maxSize=500)
+      if (!nrow(res)) return(NULL)
+      res <- as.data.frame(res)
+      res$leadingEdge <- vapply(res$leadingEdge,paste,character(1),collapse=";")
+      res$database <- db;res$subtype <- a$subtype[1];res$contrast <- a$contrast[1]
+      res
+    }) |> bind_rows()
+  })
+  gsea_res <- bind_rows(gs)
+  if (nrow(gsea_res)) {
+    write_csv(gsea_res,"fgsea_Hallmark_Reactome_by_subtype_day.csv")
+    dt(gsea_res %>% filter(padj<P$fdr) %>% arrange(padj) %>%
+      select(database,subtype,contrast,pathway,NES,padj,size,leadingEdge))
+  }
+} else cat("GSEA skipped: run_gsea=FALSE, no DEGs, or fgsea/msigdbr missing.\n")
+```
+
+```{r pathway-heatmap, fig.width=18, fig.height=8}
+# Rows = top Hallmark pathways (clustered), panels = EC subtype, columns = day vs D0.
+# Diverging scale centred on 0: red = up vs D0, blue = down. White dot = FDR significant. Blank = not tested.
+if (nrow(gsea_res)) {
+  h <- filter(gsea_res, database == "Hallmark")
+  top_paths <- h %>% group_by(pathway) %>% summarise(best = min(padj, na.rm = TRUE), .groups = "drop") %>%
+    arrange(best) %>% slice_head(n = 25) %>% pull(pathway)
+  h <- h %>% filter(pathway %in% top_paths) %>%
+    mutate(day = sub(" vs D0$", "", contrast), path = gsub("_", " ", sub("^HALLMARK_", "", pathway)))
+  if (nrow(h)) {
+    sub_lv <- unique(h$subtype); sub_lv <- setdiff(sub_lv, "All_EC")
+    sub_lv <- c(intersect("All_EC", h$subtype), sub_lv[order(nchar(sub_lv), sub_lv)])
+    h$subtype <- factor(h$subtype, levels = sub_lv)
+    h$day <- factor(h$day, levels = intersect(day_levels, unique(h$day)))
+    w <- tidyr::pivot_wider(h, id_cols = path, names_from = c(subtype, day), values_from = NES, values_fill = 0)
+    m <- as.matrix(w[, -1]); rownames(m) <- w$path
+    ord <- if (nrow(m) > 2) hclust(dist(m))$order else seq_len(nrow(m))
+    h$path <- factor(h$path, levels = rev(w$path[ord]))
+    lim <- min(3, max(abs(h$NES), na.rm = TRUE))
+    print(ggplot(h, aes(day, path, fill = NES)) +
+      geom_tile(colour = "white", linewidth = .3) +
+      geom_point(data = filter(h, padj < P$fdr), aes(day, path), inherit.aes = FALSE,
+                 shape = 21, fill = "white", colour = "black", size = 1.6, stroke = .4) +
+      scale_fill_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B", midpoint = 0,
+                           limits = c(-lim, lim), oob = scales::squish, name = "NES") +
+      facet_grid(. ~ subtype, scales = "free_x", space = "free_x") +
+      theme_minimal(base_size = 10) +
+      theme(panel.grid = element_blank(), panel.spacing.x = unit(.2, "lines"),
+            strip.text = element_text(face = "bold"),
+            axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1, size = 7)) +
+      labs(x = "Day vs D0", y = NULL, title = "Hallmark pathway NES by EC subtype",
+           subtitle = "Red = up vs D0, blue = down. White dot = FDR significant. Blank = not tested."))
+  }
+}
+```
+
+
+## Summary and conclusions
+
+The analyses above describe (1) endothelial subtype composition across DSS time points, (2) day-associated transcriptional changes within each subtype, and (3) enriched biological pathways. The tables and plots should be interpreted together rather than treating an individual volcano-plot hit as evidence of a mechanism.
+
+```{r concise-conclusions, results='asis'}
+if (exists("de_counts") && nrow(de_counts)) {
+  summary_de <- de_counts %>% group_by(contrast) %>% summarise(
+    significant_up=sum(up), significant_down=sum(down),
+    subtype_comparisons=n(),.groups="drop")
+  cat("**Differential-expression overview (counts summed across tested subtype comparisons):**\n\n")
+  print(knitr::kable(summary_de))
+  cat("\n\n")
+} else cat("No differential-expression contrasts passed the analysis requirements.\n\n")
+if (exists("gsea_res") && nrow(gsea_res)) {
+  gsum <- gsea_res %>% filter(!is.na(padj),padj<P$fdr) %>%
+    group_by(database,contrast) %>% summarise(significant_pathways=n(),.groups="drop")
+  if (nrow(gsum)) {
+    cat("**Significant gene-set enrichments (FDR threshold specified above):**\n\n")
+    print(knitr::kable(gsum))
+  } else cat("No gene sets passed the chosen FDR threshold.\n\n")
+} else cat("Pathway enrichment was unavailable or produced no results.\n\n")
+```
+
+**Answers to the collaborators' questions:** The subtype annotation and proportion figures address which EC populations are represented and how their relative representation varies. Subtype-specific differential expression and enrichment address changes in EC properties and candidate inflammatory programs. An inflammation-associated EC *state* is supported by coordinated expression changes; a newly arising *subtype* would require stronger cluster-level identity evidence. Immune–EC CellChat is not assessed here because it requires the additional immune-cell dataset.
+
+**Interpretation:** Prioritize subtype/day patterns that recur across multiple genes and coherent pathways. Because library and day are largely confounded, these comparisons establish associations with sampling day rather than separating biological time effects from library effects. The D5/D9 sample-key discrepancy should be resolved before final biological claims.
